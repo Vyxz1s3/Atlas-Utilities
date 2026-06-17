@@ -25,14 +25,137 @@ app.use(express.json());
 const pendingEmbeds = new Map();
 
 /**
+ * Detects whether a parsed JSON object is a discohook layout payload.
+ * Discohook's JSON Data Editor exports a proprietary format that uses
+ * non-standard component types (17 = container, 10 = text, 12 = media
+ * gallery, 14 = separator, 1 = action row, 3 = select menu) and a
+ * top-level `flags` field.  This is NOT the standard Discord embed JSON
+ * that Discord.js expects.
+ *
+ * @param {object} json
+ * @returns {boolean}
+ */
+function isDiscohookLayout(json) {
+  return (
+    typeof json === 'object' &&
+    json !== null &&
+    'flags' in json &&
+    Array.isArray(json.components) &&
+    json.components.length > 0 &&
+    typeof json.components[0].type === 'number'
+  );
+}
+
+/**
+ * Converts a discohook layout payload into a normalised message payload
+ * containing a standard Discord embed.
+ *
+ * Component type reference (discohook-specific):
+ *   17 — Container  (top-level wrapper; carries accent_color)
+ *   10 — Text Display  (plain text block → embed description)
+ *   12 — Media Gallery  (images → embed image, first one wins)
+ *   14 — Separator  (spacing/divider, ignored)
+ *    1 — Action Row  (interactive, ignored — Discord.js can't recreate)
+ *    3 — Select Menu (interactive, ignored)
+ *
+ * @param {object} json
+ * @returns {{ embeds: object[], content: string|undefined }}
+ */
+function convertDiscohookLayout(json) {
+  const embedData = {};
+  const descriptionParts = [];
+
+  /**
+   * Recursively walks a component tree and extracts meaningful content.
+   * @param {object[]} components
+   */
+  function walk(components) {
+    if (!Array.isArray(components)) return;
+
+    for (const component of components) {
+      switch (component.type) {
+        case 17: {
+          // Container — extract accent colour then recurse into children.
+          if (typeof component.accent_color === 'number' && !('color' in embedData)) {
+            embedData.color = component.accent_color;
+          }
+          walk(component.components);
+          break;
+        }
+
+        case 10: {
+          // Text Display — accumulate as embed description.
+          if (typeof component.content === 'string' && component.content.trim()) {
+            descriptionParts.push(component.content.trim());
+          }
+          break;
+        }
+
+        case 12: {
+          // Media Gallery — use the first image as the embed image.
+          if (!('image' in embedData) && Array.isArray(component.items)) {
+            const firstItem = component.items.find(
+              (item) => item?.media?.url || item?.url,
+            );
+            if (firstItem) {
+              const url = firstItem?.media?.url ?? firstItem?.url;
+              if (url) embedData.image = { url };
+            }
+          }
+          break;
+        }
+
+        case 14:
+          // Separator — nothing to extract.
+          break;
+
+        case 1:
+        case 3:
+          // Interactive components (action rows, select menus) — skip.
+          break;
+
+        default:
+          // Unknown component type — recurse if it has children.
+          if (Array.isArray(component.components)) {
+            walk(component.components);
+          }
+          break;
+      }
+    }
+  }
+
+  walk(json.components);
+
+  if (descriptionParts.length > 0) {
+    embedData.description = descriptionParts.join('\n\n');
+  }
+
+  // Only return an embed if we actually extracted something meaningful.
+  const hasContent = embedData.description || embedData.image || 'color' in embedData;
+
+  return {
+    embeds: hasContent ? [embedData] : [],
+    content: undefined,
+  };
+}
+
+/**
  * Normalises a parsed JSON object into an array of { embeds, content }
  * message payloads regardless of whether it came from a webhook export
  * (with a top-level `messages` array) or is a flat embed/payload object.
+ *
+ * Also handles discohook's proprietary layout format (flags + typed
+ * components) by converting it to a standard embed before returning.
  *
  * @param {object} json
  * @returns {{ embeds: object[], content: string|undefined }[]}
  */
 function normalisePayload(json) {
+  // Discohook layout format — convert before anything else.
+  if (isDiscohookLayout(json)) {
+    return [convertDiscohookLayout(json)];
+  }
+
   if (Array.isArray(json.messages)) {
     return json.messages.map((msg) => {
       const d = msg.data ?? msg;
