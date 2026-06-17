@@ -250,7 +250,7 @@ client.once('ready', async () => {
     .addStringOption((option) =>
       option
         .setName('url')
-        .setDescription('Paste raw JSON directly, or provide a direct URL that returns JSON (e.g. a Discohook JSON export URL)')
+        .setDescription('Raw JSON or a URL that returns JSON embed data')
         .setRequired(true),
     );
 
