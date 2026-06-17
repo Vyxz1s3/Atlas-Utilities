@@ -107,7 +107,7 @@ client.on('interactionCreate', async (interaction) => {
     const looksLikeUrl = /^https?:\/\//i.test(input);
 
     if (looksLikeUrl) {
-      // ── URL: fetch JSON from the remote endpoint ─────────────────────────
+      // ── URL: parse and validate ───────────────────────────────────────────
       let url;
       try {
         url = new URL(input);
@@ -116,18 +116,67 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply({ content: '❌ Invalid URL. Please provide a valid `http` or `https` URL.' });
       }
 
-      try {
-        const response = await fetch(url.toString());
-        if (!response.ok) {
+      // ── Discohook share link: https://discohook.app/?share=SHAREID ────────
+      const isDiscohook =
+        url.hostname === 'discohook.app' || url.hostname === 'www.discohook.app';
+      const shareId = url.searchParams.get('share');
+
+      if (isDiscohook && shareId) {
+        // Try the known API endpoints in order, stopping at the first success.
+        const candidates = [
+          `https://discohook.app/api/webhooks/${shareId}`,
+          `https://api.discohook.app/webhooks/${shareId}`,
+          `https://discohook.app/api/share/${shareId}`,
+          `https://share.discohook.app/${shareId}`,
+        ];
+
+        let resolved = false;
+        for (const endpoint of candidates) {
+          try {
+            console.log(`[discohook] trying ${endpoint}`);
+            const response = await fetch(endpoint, {
+              headers: { Accept: 'application/json' },
+            });
+
+            if (!response.ok) {
+              console.log(`[discohook] ${endpoint} → ${response.status}`);
+              continue;
+            }
+
+            const json = await response.json();
+            messages = normalisePayload(json);
+            resolved = true;
+            console.log(`[discohook] resolved via ${endpoint}`);
+            break;
+          } catch (err) {
+            console.log(`[discohook] ${endpoint} failed: ${err.message}`);
+          }
+        }
+
+        if (!resolved) {
           return interaction.editReply({
-            content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.`,
+            content:
+              `❌ Could not retrieve the Discohook share \`${shareId}\` from any known API endpoint.\n` +
+              'Make sure the share link is still valid and try again.',
           });
         }
-        const json = await response.json();
-        messages = normalisePayload(json);
-      } catch (err) {
-        console.error('/deploy fetch error:', err);
-        return interaction.editReply({ content: `❌ Could not fetch or parse JSON from the URL: ${err.message}` });
+      } else {
+        // ── Generic JSON URL ────────────────────────────────────────────────
+        try {
+          const response = await fetch(url.toString(), {
+            headers: { Accept: 'application/json' },
+          });
+          if (!response.ok) {
+            return interaction.editReply({
+              content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.`,
+            });
+          }
+          const json = await response.json();
+          messages = normalisePayload(json);
+        } catch (err) {
+          console.error('/deploy fetch error:', err);
+          return interaction.editReply({ content: `❌ Could not fetch or parse JSON from the URL: ${err.message}` });
+        }
       }
     } else {
       // ── Raw JSON: parse the pasted text directly ─────────────────────────
@@ -243,11 +292,11 @@ client.once('ready', async () => {
 
   const deployCommand = new SlashCommandBuilder()
     .setName('deploy')
-    .setDescription('Deploy a webhook embed payload from a JSON URL or raw JSON text')
+    .setDescription('Deploy a webhook embed payload from a Discohook share link, JSON URL, or raw JSON')
     .addStringOption((option) =>
       option
         .setName('url')
-        .setDescription('A URL that returns JSON embed data, or raw JSON pasted directly')
+        .setDescription('A Discohook share link (https://discohook.app/?share=…), JSON URL, or raw JSON')
         .setRequired(true),
     );
 
