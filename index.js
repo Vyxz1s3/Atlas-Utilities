@@ -5,6 +5,9 @@ const {
   ActionRowBuilder,
   EmbedBuilder,
   ChannelType,
+  REST,
+  Routes,
+  SlashCommandBuilder,
 } = require('discord.js');
 const express = require('express');
 
@@ -68,6 +71,73 @@ app.post('/webhook', async (req, res) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // ── /deploy slash command ────────────────────────────────────────────────
+  if (interaction.isChatInputCommand() && interaction.commandName === 'deploy') {
+    const url = interaction.options.getString('url', true);
+
+    await interaction.deferReply({ ephemeral: true });
+
+    // Validate URL format before fetching.
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('URL must use http or https.');
+      }
+    } catch {
+      return interaction.editReply({ content: '❌ Invalid URL provided. Please supply a valid `http` or `https` URL.' });
+    }
+
+    // Fetch the webhook payload from the provided URL.
+    let embedData;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        return interaction.editReply({ content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.` });
+      }
+      embedData = await response.json();
+    } catch (err) {
+      console.error('/deploy fetch error:', err);
+      return interaction.editReply({ content: `❌ Could not fetch or parse the URL: ${err.message}` });
+    }
+
+    // Build the channel-picker dropdown from the guild's text channels.
+    const guild = interaction.guild;
+    const channels = await guild.channels.fetch();
+    const textChannels = channels.filter((ch) => ch?.type === ChannelType.GuildText);
+
+    if (textChannels.size === 0) {
+      return interaction.editReply({ content: '❌ No text channels found in this server.' });
+    }
+
+    const options = textChannels
+      .map((ch) => ({ label: `#${ch.name}`, value: ch.id }))
+      .slice(0, 25);
+
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId('embed_channel_select')
+      .setPlaceholder('Select a channel to send the embed to')
+      .addOptions(options);
+
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+
+    const promptEmbed = new EmbedBuilder()
+      .setTitle('Select a Channel')
+      .setDescription('Choose the channel where the embed should be sent.')
+      .setColor(0x0099ff);
+
+    // Send the picker as a follow-up so we have a stable message ID to key on.
+    const msg = await interaction.followUp({
+      embeds: [promptEmbed],
+      components: [row],
+      ephemeral: true,
+    });
+
+    pendingEmbeds.set(msg.id, { embedData, guildId: guild.id });
+    return;
+  }
+
+  // ── Channel select-menu handler ──────────────────────────────────────────
   if (!interaction.isStringSelectMenu()) return;
   if (interaction.customId !== 'embed_channel_select') return;
 
@@ -100,8 +170,30 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`✅ Bot ready — logged in as ${client.user.tag}`);
+
+  const deployCommand = new SlashCommandBuilder()
+    .setName('deploy')
+    .setDescription('Fetch a webhook payload from a URL and send it as an embed to a channel')
+    .addStringOption((option) =>
+      option
+        .setName('url')
+        .setDescription('The URL to fetch the embed JSON payload from')
+        .setRequired(true),
+    );
+
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+  try {
+    console.log('🔄 Registering /deploy slash command...');
+    await rest.put(Routes.applicationCommands(client.user.id), {
+      body: [deployCommand.toJSON()],
+    });
+    console.log('✅ /deploy slash command registered globally.');
+  } catch (err) {
+    console.error('Failed to register slash commands:', err);
+  }
 });
 
 client.login(process.env.DISCORD_TOKEN);
