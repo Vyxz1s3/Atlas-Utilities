@@ -1,438 +1,346 @@
 const {
   Client,
   GatewayIntentBits,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
-  ActionRowBuilder,
-  EmbedBuilder,
-  ChannelType,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
 } = require('discord.js');
-const express = require('express');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-const app = express();
-app.use(express.json());
-
-// Stores parsed embed payloads keyed by a unique pending key so the
-// select-menu interaction handler can retrieve them after the user picks
-// a channel from the dropdown.
-const pendingEmbeds = new Map();
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Detects whether a parsed JSON object is a discohook layout payload.
- * Discohook's JSON Data Editor exports a proprietary format that uses
- * non-standard component types (17 = container, 10 = text, 12 = media
- * gallery, 14 = separator, 1 = action row, 3 = select menu) and a
- * top-level `flags` field.  This is NOT the standard Discord embed JSON
- * that Discord.js expects.
+ * Parses a duration string like "10m", "2h", "1d" into milliseconds.
+ * Supported units: s (seconds), m (minutes), h (hours), d (days).
+ * Returns null if the string is not a valid duration.
  *
- * @param {object} json
- * @returns {boolean}
+ * @param {string} str
+ * @returns {number|null}
  */
-function isDiscohookLayout(json) {
-  return (
-    typeof json === 'object' &&
-    json !== null &&
-    'flags' in json &&
-    Array.isArray(json.components) &&
-    json.components.length > 0 &&
-    typeof json.components[0].type === 'number'
-  );
+function parseDuration(str) {
+  const match = str.trim().match(/^(\d+)(s|m|h|d)$/i);
+  if (!match) return null;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const multipliers = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  return value * multipliers[unit];
 }
 
-/**
- * Converts a discohook layout payload into a normalised message payload
- * containing a standard Discord embed.
- *
- * Component type reference (discohook-specific):
- *   17 — Container  (top-level wrapper; carries accent_color)
- *   10 — Text Display  (plain text block → embed description)
- *   12 — Media Gallery  (images → embed image, first one wins)
- *   14 — Separator  (spacing/divider, ignored)
- *    1 — Action Row  (interactive, ignored — Discord.js can't recreate)
- *    3 — Select Menu (interactive, ignored)
- *
- * @param {object} json
- * @returns {{ embeds: object[], content: string|undefined }}
- */
-function convertDiscohookLayout(json) {
-  const embedData = {};
-  const descriptionParts = [];
-
-  /**
-   * Recursively walks a component tree and extracts meaningful content.
-   * @param {object[]} components
-   */
-  function walk(components) {
-    if (!Array.isArray(components)) return;
-
-    for (const component of components) {
-      switch (component.type) {
-        case 17: {
-          // Container — extract accent colour then recurse into children.
-          if (typeof component.accent_color === 'number' && !('color' in embedData)) {
-            embedData.color = component.accent_color;
-          }
-          walk(component.components);
-          break;
-        }
-
-        case 10: {
-          // Text Display — accumulate as embed description.
-          if (typeof component.content === 'string' && component.content.trim()) {
-            descriptionParts.push(component.content.trim());
-          }
-          break;
-        }
-
-        case 12: {
-          // Media Gallery — use the first image as the embed image.
-          if (!('image' in embedData) && Array.isArray(component.items)) {
-            const firstItem = component.items.find(
-              (item) => item?.media?.url || item?.url,
-            );
-            if (firstItem) {
-              const url = firstItem?.media?.url ?? firstItem?.url;
-              if (url) embedData.image = { url };
-            }
-          }
-          break;
-        }
-
-        case 14:
-          // Separator — nothing to extract.
-          break;
-
-        case 1:
-        case 3:
-          // Interactive components (action rows, select menus) — skip.
-          break;
-
-        default:
-          // Unknown component type — recurse if it has children.
-          if (Array.isArray(component.components)) {
-            walk(component.components);
-          }
-          break;
-      }
-    }
-  }
-
-  walk(json.components);
-
-  if (descriptionParts.length > 0) {
-    embedData.description = descriptionParts.join('\n\n');
-  }
-
-  // Only return an embed if we actually extracted something meaningful.
-  const hasContent = embedData.description || embedData.image || 'color' in embedData;
-
-  return {
-    embeds: hasContent ? [embedData] : [],
-    content: undefined,
-  };
-}
-
-/**
- * Normalises a parsed JSON object into an array of { embeds, content }
- * message payloads regardless of whether it came from a webhook export
- * (with a top-level `messages` array) or is a flat embed/payload object.
- *
- * Also handles discohook's proprietary layout format (flags + typed
- * components) by converting it to a standard embed before returning.
- *
- * @param {object} json
- * @returns {{ embeds: object[], content: string|undefined }[]}
- */
-function normalisePayload(json) {
-  // Discohook layout format — convert before anything else.
-  if (isDiscohookLayout(json)) {
-    return [convertDiscohookLayout(json)];
-  }
-
-  if (Array.isArray(json.messages)) {
-    return json.messages.map((msg) => {
-      const d = msg.data ?? msg;
-      return {
-        embeds: Array.isArray(d.embeds) ? d.embeds : [],
-        content: d.content ?? undefined,
-      };
-    });
-  }
-  // Flat object — treat as a single message payload.
-  return [{ embeds: Array.isArray(json.embeds) ? json.embeds : [json], content: json.content ?? undefined }];
-}
-
-
-app.post('/webhook', async (req, res) => {
-  try {
-    const { guildId, embedData, channelName } = req.body;
-
-    if (!guildId || !embedData) {
-      return res.status(400).json({ error: 'guildId and embedData are required' });
-    }
-
-    if (!channelName) {
-      return res.status(400).json({ error: 'channelName is required — provide the name of the channel to send the embed to' });
-    }
-
-    const guild = await client.guilds.fetch(guildId);
-    const channels = await guild.channels.fetch();
-    const textChannels = channels.filter((ch) => ch?.type === ChannelType.GuildText);
-
-    if (textChannels.size === 0) {
-      return res.status(400).json({ error: 'No text channels found in this guild' });
-    }
-
-    const normalised = channelName.trim().toLowerCase().replace(/^#/, '');
-    const matches = textChannels.filter((ch) => ch.name.toLowerCase().includes(normalised));
-
-    if (matches.size === 0) {
-      return res.status(404).json({ error: `No text channel found matching "${normalised}"` });
-    }
-
-    if (matches.size > 1) {
-      const names = matches.map((ch) => `#${ch.name}`).join(', ');
-      return res.status(400).json({ error: `Multiple channels match "${normalised}": ${names}. Please be more specific.` });
-    }
-
-    const targetChannel = matches.first();
-    const messages = normalisePayload(embedData);
-
-    for (const msgPayload of messages) {
-      const sendOptions = {};
-
-      if (msgPayload.content) {
-        sendOptions.content = msgPayload.content;
-      }
-
-      if (msgPayload.embeds && msgPayload.embeds.length > 0) {
-        sendOptions.embeds = msgPayload.embeds.map((e) => new EmbedBuilder(e));
-      }
-
-      if (!sendOptions.content && !sendOptions.embeds) continue;
-
-      await targetChannel.send(sendOptions);
-    }
-
-    return res.json({ success: true, channelId: targetChannel.id, channelName: targetChannel.name, messageCount: messages.length });
-  } catch (err) {
-    console.error('POST /webhook error:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+// ── Interaction handler ───────────────────────────────────────────────────────
 
 client.on('interactionCreate', async (interaction) => {
-  // ── /deploy slash command ────────────────────────────────────────────────
-  if (interaction.isChatInputCommand() && interaction.commandName === 'deploy') {
-    const input = interaction.options.getString('url', true).trim();
+  if (!interaction.isChatInputCommand()) return;
 
-    await interaction.deferReply({ ephemeral: true });
+  const { commandName, options, guild, member, channel } = interaction;
 
-    let messages;
-
-    // Determine whether the input is a URL or raw JSON text.
-    const looksLikeUrl = /^https?:\/\//i.test(input);
-
-    if (looksLikeUrl) {
-      // ── URL: parse and validate ───────────────────────────────────────────
-      let url;
-      try {
-        url = new URL(input);
-        if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
-      } catch {
-        return interaction.editReply({
-          content: '❌ Invalid URL. Please provide a valid `http` or `https` URL.',
-        });
-      }
-
-      // ── Direct JSON URL ──────────────────────────────────────────────────
-      try {
-        const response = await fetch(url.toString(), {
-          headers: { Accept: 'application/json' },
-        });
-        if (!response.ok) {
-          return interaction.editReply({
-            content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.`,
-          });
-        }
-        const json = await response.json();
-        messages = normalisePayload(json);
-      } catch (err) {
-        console.error('/deploy fetch error:', err);
-        return interaction.editReply({
-          content: `❌ Could not fetch or parse JSON from the URL: ${err.message}`,
-        });
-      }
-    } else {
-      // ── Raw JSON: parse the pasted text directly ─────────────────────────
-      let json;
-      try {
-        json = JSON.parse(input);
-      } catch {
-        return interaction.editReply({
-          content: '❌ Input is not a valid URL and could not be parsed as JSON. Please provide a URL that returns JSON or paste raw JSON directly.',
-        });
-      }
-      messages = normalisePayload(json);
+  // ── /ban ──────────────────────────────────────────────────────────────────
+  if (commandName === 'ban') {
+    if (!member.permissions.has(PermissionFlagsBits.BanMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to ban members.', ephemeral: true });
     }
 
-    if (!messages || messages.length === 0) {
-      return interaction.editReply({ content: '❌ No message data found in the provided input.' });
+    const target = options.getMember('user');
+    const reason = options.getString('reason') ?? 'No reason provided';
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
     }
 
-    // Fetch all text channels in the guild.
-    const guild = await client.guilds.fetch(interaction.guild.id);
-    const channels = await guild.channels.fetch();
-    const textChannels = [...channels.filter((ch) => ch?.type === ChannelType.GuildText).values()]
-      .sort((a, b) => a.name.localeCompare(b.name));
-
-    if (textChannels.length === 0) {
-      return interaction.editReply({ content: '❌ No text channels found in this server.' });
+    if (!target.bannable) {
+      return interaction.reply({ content: '❌ I cannot ban this user. They may have a higher role than me.', ephemeral: true });
     }
 
-    // Store the parsed messages keyed by a unique ID so the select-menu
-    // handler can retrieve them after the user picks a channel.
-    const pendingKey = `${interaction.user.id}_${Date.now()}`;
-    pendingEmbeds.set(pendingKey, { messages, guildId: interaction.guild.id });
-
-    // Discord allows up to 25 options per StringSelectMenu and up to 5
-    // ActionRows per message. We therefore support up to 125 channels
-    // across 5 paginated select menus sent as a single ephemeral reply.
-    const MAX_OPTIONS = 25;
-    const MAX_ROWS = 5;
-    const channelChunks = [];
-    for (let i = 0; i < textChannels.length && channelChunks.length < MAX_ROWS; i += MAX_OPTIONS) {
-      channelChunks.push(textChannels.slice(i, i + MAX_OPTIONS));
+    try {
+      await target.ban({ reason });
+      return interaction.reply({ content: `✅ Banned **${target.user.tag}**. Reason: ${reason}` });
+    } catch (err) {
+      console.error('/ban error:', err);
+      return interaction.reply({ content: `❌ Failed to ban user: ${err.message}`, ephemeral: true });
     }
-
-    const actionRows = channelChunks.map((chunk, idx) => {
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`channel_select:${pendingKey}:${idx}`)
-        .setPlaceholder(
-          channelChunks.length > 1
-            ? `Select a channel (${idx * MAX_OPTIONS + 1}–${idx * MAX_OPTIONS + chunk.length})`
-            : 'Select a channel',
-        )
-        .addOptions(
-          chunk.map((ch) =>
-            new StringSelectMenuOptionBuilder()
-              .setLabel(`#${ch.name}`)
-              .setValue(ch.id),
-          ),
-        );
-      return new ActionRowBuilder().addComponents(menu);
-    });
-
-    const truncated = textChannels.length > MAX_ROWS * MAX_OPTIONS;
-    return interaction.editReply({
-      content: truncated
-        ? `📋 Select a channel below. *(Showing first ${MAX_ROWS * MAX_OPTIONS} of ${textChannels.length} channels.)*`
-        : '📋 Select a channel to send the embed to:',
-      components: actionRows,
-    });
   }
 
-  // ── Select-menu: user picked a channel from the dropdown ─────────────────
-  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('channel_select:')) {
-    // customId format: channel_select:<pendingKey>:<pageIndex>
-    const withoutPrefix = interaction.customId.slice('channel_select:'.length);
-    // pendingKey itself contains one underscore (userId_timestamp), so split
-    // from the right to isolate the trailing page index.
-    const lastColon = withoutPrefix.lastIndexOf(':');
-    const pendingKey = withoutPrefix.slice(0, lastColon);
-    const data = pendingEmbeds.get(pendingKey);
+  // ── /kick ─────────────────────────────────────────────────────────────────
+  if (commandName === 'kick') {
+    if (!member.permissions.has(PermissionFlagsBits.KickMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to kick members.', ephemeral: true });
+    }
 
-    if (!data) {
+    const target = options.getMember('user');
+    const reason = options.getString('reason') ?? 'No reason provided';
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
+    }
+
+    if (!target.kickable) {
+      return interaction.reply({ content: '❌ I cannot kick this user. They may have a higher role than me.', ephemeral: true });
+    }
+
+    try {
+      await target.kick(reason);
+      return interaction.reply({ content: `✅ Kicked **${target.user.tag}**. Reason: ${reason}` });
+    } catch (err) {
+      console.error('/kick error:', err);
+      return interaction.reply({ content: `❌ Failed to kick user: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /mute ─────────────────────────────────────────────────────────────────
+  if (commandName === 'mute') {
+    if (!member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to mute members.', ephemeral: true });
+    }
+
+    const target = options.getMember('user');
+    const durationStr = options.getString('duration', true);
+    const reason = options.getString('reason') ?? 'No reason provided';
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
+    }
+
+    const ms = parseDuration(durationStr);
+    if (!ms) {
       return interaction.reply({
-        content: '⚠️ Embed data not found — it may have expired. Please run `/deploy` again.',
+        content: '❌ Invalid duration. Use a number followed by `s`, `m`, `h`, or `d` (e.g. `10m`, `2h`, `1d`).',
         ephemeral: true,
       });
     }
 
-    const channelId = interaction.values[0];
+    // Discord's timeout cap is 28 days.
+    const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
+    if (ms > MAX_TIMEOUT_MS) {
+      return interaction.reply({ content: '❌ Duration cannot exceed 28 days.', ephemeral: true });
+    }
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!target.moderatable) {
+      return interaction.reply({ content: '❌ I cannot mute this user. They may have a higher role than me.', ephemeral: true });
+    }
 
     try {
-      const guild = await client.guilds.fetch(data.guildId);
-      const channel = await guild.channels.fetch(channelId);
-
-      if (!channel) {
-        return interaction.editReply({ content: '❌ Could not find the selected channel.' });
-      }
-
-      // Send every message from the payload in order.
-      for (const msgPayload of data.messages) {
-        const sendOptions = {};
-
-        if (msgPayload.content) {
-          sendOptions.content = msgPayload.content;
-        }
-
-        if (msgPayload.embeds && msgPayload.embeds.length > 0) {
-          sendOptions.embeds = msgPayload.embeds.map((e) => new EmbedBuilder(e));
-        }
-
-        // Skip empty messages (no content and no embeds).
-        if (!sendOptions.content && !sendOptions.embeds) continue;
-
-        await channel.send(sendOptions);
-      }
-
-      pendingEmbeds.delete(pendingKey);
-
-      const count = data.messages.length;
-      const messageWord = count === 1 ? 'message' : 'messages';
-
-      // Remove the dropdown from the original reply now that a channel was chosen.
-      await interaction.message.edit({ components: [] }).catch(() => {});
-
-      return interaction.editReply({
-        content: `✅ Sent **${count} ${messageWord}** to <#${channel.id}>`,
-      });
+      await target.timeout(ms, reason);
+      return interaction.reply({ content: `✅ Muted **${target.user.tag}** for **${durationStr}**. Reason: ${reason}` });
     } catch (err) {
-      console.error('Select-menu handler error:', err);
-      return interaction.editReply({ content: `❌ Failed to send embed: ${err.message}` });
+      console.error('/mute error:', err);
+      return interaction.reply({ content: `❌ Failed to mute user: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /unmute ───────────────────────────────────────────────────────────────
+  if (commandName === 'unmute') {
+    if (!member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to unmute members.', ephemeral: true });
+    }
+
+    const target = options.getMember('user');
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
+    }
+
+    if (!target.moderatable) {
+      return interaction.reply({ content: '❌ I cannot unmute this user. They may have a higher role than me.', ephemeral: true });
+    }
+
+    try {
+      await target.timeout(null);
+      return interaction.reply({ content: `✅ Unmuted **${target.user.tag}**.` });
+    } catch (err) {
+      console.error('/unmute error:', err);
+      return interaction.reply({ content: `❌ Failed to unmute user: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /warn ─────────────────────────────────────────────────────────────────
+  if (commandName === 'warn') {
+    if (!member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to warn members.', ephemeral: true });
+    }
+
+    const target = options.getMember('user');
+    const reason = options.getString('reason') ?? 'No reason provided';
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
+    }
+
+    try {
+      await target.send(`⚠️ You have been warned in **${guild.name}**. Reason: ${reason}`).catch(() => null);
+      return interaction.reply({ content: `⚠️ Warned **${target.user.tag}**. Reason: ${reason}` });
+    } catch (err) {
+      console.error('/warn error:', err);
+      return interaction.reply({ content: `❌ Failed to warn user: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /timeout ──────────────────────────────────────────────────────────────
+  if (commandName === 'timeout') {
+    if (!member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to timeout members.', ephemeral: true });
+    }
+
+    const target = options.getMember('user');
+    const durationStr = options.getString('duration', true);
+    const reason = options.getString('reason') ?? 'No reason provided';
+
+    if (!target) {
+      return interaction.reply({ content: '❌ Could not find that user in this server.', ephemeral: true });
+    }
+
+    const ms = parseDuration(durationStr);
+    if (!ms) {
+      return interaction.reply({
+        content: '❌ Invalid duration. Use a number followed by `s`, `m`, `h`, or `d` (e.g. `10m`, `2h`, `1d`).',
+        ephemeral: true,
+      });
+    }
+
+    const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
+    if (ms > MAX_TIMEOUT_MS) {
+      return interaction.reply({ content: '❌ Duration cannot exceed 28 days.', ephemeral: true });
+    }
+
+    if (!target.moderatable) {
+      return interaction.reply({ content: '❌ I cannot timeout this user. They may have a higher role than me.', ephemeral: true });
+    }
+
+    try {
+      await target.timeout(ms, reason);
+      return interaction.reply({ content: `⏱️ Timed out **${target.user.tag}** for **${durationStr}**. Reason: ${reason}` });
+    } catch (err) {
+      console.error('/timeout error:', err);
+      return interaction.reply({ content: `❌ Failed to timeout user: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /clear ────────────────────────────────────────────────────────────────
+  if (commandName === 'clear') {
+    if (!member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      return interaction.reply({ content: '❌ You do not have permission to delete messages.', ephemeral: true });
+    }
+
+    const amount = options.getInteger('amount', true);
+
+    if (amount < 2 || amount > 100) {
+      return interaction.reply({ content: '❌ Amount must be between 2 and 100.', ephemeral: true });
+    }
+
+    try {
+      const deleted = await channel.bulkDelete(amount, true);
+      return interaction.reply({ content: `🗑️ Deleted **${deleted.size}** message(s).`, ephemeral: true });
+    } catch (err) {
+      console.error('/clear error:', err);
+      return interaction.reply({ content: `❌ Failed to delete messages: ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ── /slowmode ─────────────────────────────────────────────────────────────
+  if (commandName === 'slowmode') {
+    if (!member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return interaction.reply({ content: '❌ You do not have permission to manage channels.', ephemeral: true });
+    }
+
+    const seconds = options.getInteger('seconds', true);
+
+    if (seconds < 0 || seconds > 21600) {
+      return interaction.reply({ content: '❌ Slowmode must be between 0 and 21600 seconds (6 hours).', ephemeral: true });
+    }
+
+    try {
+      await channel.setRateLimitPerUser(seconds);
+      if (seconds === 0) {
+        return interaction.reply({ content: '✅ Slowmode disabled.' });
+      }
+      return interaction.reply({ content: `✅ Slowmode set to **${seconds}** second(s).` });
+    } catch (err) {
+      console.error('/slowmode error:', err);
+      return interaction.reply({ content: `❌ Failed to set slowmode: ${err.message}`, ephemeral: true });
     }
   }
 });
 
+// ── Ready & command registration ──────────────────────────────────────────────
+
 client.once('ready', async () => {
   console.log(`✅ Bot ready — logged in as ${client.user.tag}`);
 
-  const deployCommand = new SlashCommandBuilder()
-    .setName('deploy')
-    .setDescription('Deploy a webhook embed payload from raw JSON or a direct JSON URL')
-    .addStringOption((option) =>
-      option
-        .setName('url')
-        .setDescription('Raw JSON or a URL that returns JSON embed data')
-        .setRequired(true),
-    );
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('ban')
+      .setDescription('Ban a user from the server')
+      .addUserOption((o) => o.setName('user').setDescription('The user to ban').setRequired(true))
+      .addStringOption((o) => o.setName('reason').setDescription('Reason for the ban')),
+
+    new SlashCommandBuilder()
+      .setName('kick')
+      .setDescription('Kick a user from the server')
+      .addUserOption((o) => o.setName('user').setDescription('The user to kick').setRequired(true))
+      .addStringOption((o) => o.setName('reason').setDescription('Reason for the kick')),
+
+    new SlashCommandBuilder()
+      .setName('mute')
+      .setDescription('Mute a user for a specified duration (uses Discord timeout)')
+      .addUserOption((o) => o.setName('user').setDescription('The user to mute').setRequired(true))
+      .addStringOption((o) =>
+        o.setName('duration').setDescription('Duration (e.g. 10m, 2h, 1d)').setRequired(true),
+      )
+      .addStringOption((o) => o.setName('reason').setDescription('Reason for the mute')),
+
+    new SlashCommandBuilder()
+      .setName('unmute')
+      .setDescription('Remove a timeout from a user')
+      .addUserOption((o) => o.setName('user').setDescription('The user to unmute').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('warn')
+      .setDescription('Send a warning to a user via DM')
+      .addUserOption((o) => o.setName('user').setDescription('The user to warn').setRequired(true))
+      .addStringOption((o) => o.setName('reason').setDescription('Reason for the warning')),
+
+    new SlashCommandBuilder()
+      .setName('timeout')
+      .setDescription("Apply Discord's built-in timeout to a user")
+      .addUserOption((o) => o.setName('user').setDescription('The user to timeout').setRequired(true))
+      .addStringOption((o) =>
+        o.setName('duration').setDescription('Duration (e.g. 10m, 2h, 1d)').setRequired(true),
+      )
+      .addStringOption((o) => o.setName('reason').setDescription('Reason for the timeout')),
+
+    new SlashCommandBuilder()
+      .setName('clear')
+      .setDescription('Bulk-delete messages in the current channel')
+      .addIntegerOption((o) =>
+        o.setName('amount').setDescription('Number of messages to delete (2–100)').setRequired(true),
+      ),
+
+    new SlashCommandBuilder()
+      .setName('slowmode')
+      .setDescription('Set the slowmode delay for the current channel')
+      .addIntegerOption((o) =>
+        o.setName('seconds').setDescription('Slowmode delay in seconds (0 to disable, max 21600)').setRequired(true),
+      ),
+  ];
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
   try {
-    console.log('🔄 Registering /deploy slash command...');
+    console.log('🔄 Registering moderation slash commands...');
     await rest.put(Routes.applicationCommands(client.user.id), {
-      body: [deployCommand.toJSON()],
+      body: commands.map((c) => c.toJSON()),
     });
-    console.log('✅ /deploy slash command registered globally.');
+    console.log('✅ Moderation slash commands registered globally.');
   } catch (err) {
     console.error('Failed to register slash commands:', err);
   }
 });
 
 client.login(process.env.DISCORD_TOKEN);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook server listening on port ${PORT}`);
-});
