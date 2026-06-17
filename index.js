@@ -10,10 +10,6 @@ const {
   SlashCommandBuilder,
 } = require('discord.js');
 const express = require('express');
-const zlib = require('zlib');
-const { promisify } = require('util');
-
-const inflateRaw = promisify(zlib.inflateRaw);
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
@@ -27,89 +23,27 @@ app.use(express.json());
 const pendingEmbeds = new Map();
 
 /**
- * Detects whether a URL is a discohook.app share link.
- * Matches both https://discohook.app/?share=<id> and
- * https://discohook.app/share/<id> style links.
+ * Normalises a parsed JSON object into an array of { embeds, content }
+ * message payloads regardless of whether it came from a webhook export
+ * (with a top-level `messages` array) or is a flat embed/payload object.
  *
- * @param {URL} parsedUrl
- * @returns {string|null} The share ID, or null if not a discohook share link.
+ * @param {object} json
+ * @returns {{ embeds: object[], content: string|undefined }[]}
  */
-function extractDiscohookShareId(parsedUrl) {
-  if (!parsedUrl.hostname.endsWith('discohook.app')) return null;
-
-  // ?share=<id> query-param style (most common)
-  const shareParam = parsedUrl.searchParams.get('share');
-  if (shareParam) return shareParam;
-
-  // /share/<id> path style
-  const pathMatch = parsedUrl.pathname.match(/^\/share\/([A-Za-z0-9_-]+)/);
-  if (pathMatch) return pathMatch[1];
-
-  return null;
+function normalisePayload(json) {
+  if (Array.isArray(json.messages)) {
+    return json.messages.map((msg) => {
+      const d = msg.data ?? msg;
+      return {
+        embeds: Array.isArray(d.embeds) ? d.embeds : [],
+        content: d.content ?? undefined,
+      };
+    });
+  }
+  // Flat object — treat as a single message payload.
+  return [{ embeds: Array.isArray(json.embeds) ? json.embeds : [json], content: json.content ?? undefined }];
 }
 
-/**
- * Resolves a discohook share ID to an array of embed objects ready to be
- * passed to EmbedBuilder.
- *
- * Discohook's share API returns a JSON envelope:
- *   { data: "<base64url-encoded, zlib-deflate-compressed JSON>" }
- *
- * The inner JSON has the shape:
- *   { messages: [{ data: { embeds: [...], content: "..." } }] }
- *
- * @param {string} shareId
- * @returns {Promise<{ embeds: object[], content: string|undefined }[]>} Array of message payloads.
- */
-async function resolveDiscohookShare(shareId) {
-  const apiUrl = `https://share.discohook.app/go/${shareId}`;
-  const response = await fetch(apiUrl);
-
-  if (!response.ok) {
-    throw new Error(`Discohook share API responded with \`${response.status} ${response.statusText}\`. The share link may be invalid or expired.`);
-  }
-
-  const envelope = await response.json();
-
-  if (!envelope.data) {
-    throw new Error('Unexpected response from discohook share API — missing `data` field.');
-  }
-
-  // The `data` field is base64url-encoded, zlib-deflate-compressed JSON.
-  // base64url uses '-' and '_' instead of '+' and '/'.
-  const base64 = envelope.data.replace(/-/g, '+').replace(/_/g, '/');
-  const compressed = Buffer.from(base64, 'base64');
-
-  let decompressed;
-  try {
-    decompressed = await inflateRaw(compressed);
-  } catch {
-    // Some share links store plain (uncompressed) base64 JSON — fall back.
-    decompressed = compressed;
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(decompressed.toString('utf8'));
-  } catch {
-    throw new Error('Could not parse the discohook share payload as JSON.');
-  }
-
-  // Normalise to an array of message payloads.
-  const messages = parsed.messages ?? parsed.backups?.[0]?.messages ?? [];
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new Error('No messages found in the discohook share payload.');
-  }
-
-  return messages.map((msg) => {
-    // Each message may nest its data under a `data` key or be flat.
-    const msgData = msg.data ?? msg;
-    return {
-      embeds: Array.isArray(msgData.embeds) ? msgData.embeds : [],
-      content: msgData.content ?? undefined,
-    };
-  });
-}
 
 app.post('/webhook', async (req, res) => {
   try {
@@ -150,10 +84,7 @@ app.post('/webhook', async (req, res) => {
       guild.systemChannel ?? textChannels.first();
 
     const msg = await targetChannel.send({ embeds: [promptEmbed], components: [row] });
-    // Normalise embedData into the messages array format used by the interaction handler.
-    const messages = Array.isArray(embedData.messages)
-      ? embedData.messages.map((m) => { const d = m.data ?? m; return { embeds: Array.isArray(d.embeds) ? d.embeds : [], content: d.content ?? undefined }; })
-      : [{ embeds: Array.isArray(embedData.embeds) ? embedData.embeds : [embedData], content: embedData.content ?? undefined }];
+    const messages = normalisePayload(embedData);
     pendingEmbeds.set(msg.id, { messages, guildId });
 
     return res.json({ success: true, messageId: msg.id });
@@ -166,65 +97,53 @@ app.post('/webhook', async (req, res) => {
 client.on('interactionCreate', async (interaction) => {
   // ── /deploy slash command ────────────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'deploy') {
-    const url = interaction.options.getString('url', true);
+    const input = interaction.options.getString('url', true).trim();
 
     await interaction.deferReply({ ephemeral: true });
 
-    // Validate URL format before fetching.
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(url);
-      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-        throw new Error('URL must use http or https.');
-      }
-    } catch {
-      return interaction.editReply({ content: '❌ Invalid URL provided. Please supply a valid `http` or `https` URL.' });
-    }
-
-    // Resolve the payload — discohook share links need special handling.
-    // `messages` is an array of { embeds, content } objects; for direct JSON
-    // URLs we normalise the single response into the same shape.
     let messages;
-    const shareId = extractDiscohookShareId(parsedUrl);
 
-    if (shareId) {
-      // ── Discohook share link ─────────────────────────────────────────────
+    // Determine whether the input is a URL or raw JSON text.
+    const looksLikeUrl = /^https?:\/\//i.test(input);
+
+    if (looksLikeUrl) {
+      // ── URL: fetch JSON from the remote endpoint ─────────────────────────
+      let url;
       try {
-        messages = await resolveDiscohookShare(shareId);
-      } catch (err) {
-        console.error('/deploy discohook resolve error:', err);
-        return interaction.editReply({ content: `❌ Could not resolve discohook share link: ${err.message}` });
+        url = new URL(input);
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+      } catch {
+        return interaction.editReply({ content: '❌ Invalid URL. Please provide a valid `http` or `https` URL.' });
       }
-    } else {
-      // ── Direct JSON URL ──────────────────────────────────────────────────
+
       try {
-        const response = await fetch(url);
+        const response = await fetch(url.toString());
         if (!response.ok) {
-          return interaction.editReply({ content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.` });
+          return interaction.editReply({
+            content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.`,
+          });
         }
         const json = await response.json();
-        // Normalise: if the JSON already has a `messages` array (discohook
-        // export format) use it; otherwise treat the whole object as a single
-        // embed payload.
-        if (Array.isArray(json.messages)) {
-          messages = json.messages.map((msg) => {
-            const msgData = msg.data ?? msg;
-            return {
-              embeds: Array.isArray(msgData.embeds) ? msgData.embeds : [],
-              content: msgData.content ?? undefined,
-            };
-          });
-        } else {
-          messages = [{ embeds: Array.isArray(json.embeds) ? json.embeds : [json], content: json.content ?? undefined }];
-        }
+        messages = normalisePayload(json);
       } catch (err) {
         console.error('/deploy fetch error:', err);
-        return interaction.editReply({ content: `❌ Could not fetch or parse the URL: ${err.message}` });
+        return interaction.editReply({ content: `❌ Could not fetch or parse JSON from the URL: ${err.message}` });
       }
+    } else {
+      // ── Raw JSON: parse the pasted text directly ─────────────────────────
+      let json;
+      try {
+        json = JSON.parse(input);
+      } catch (err) {
+        return interaction.editReply({
+          content: '❌ Input is not a valid URL and could not be parsed as JSON. Please provide a URL that returns JSON or paste raw JSON directly.',
+        });
+      }
+      messages = normalisePayload(json);
     }
 
     if (!messages || messages.length === 0) {
-      return interaction.editReply({ content: '❌ No message data found at the provided URL.' });
+      return interaction.editReply({ content: '❌ No message data found in the provided input.' });
     }
 
     // Build the channel-picker dropdown from the guild's text channels.
@@ -247,15 +166,12 @@ client.on('interactionCreate', async (interaction) => {
 
     const row = new ActionRowBuilder().addComponents(selectMenu);
 
-    const sourceLabel = shareId
-      ? `discohook share \`${shareId}\``
-      : 'the provided URL';
     const messageWord = messages.length === 1 ? 'message' : 'messages';
 
     const promptEmbed = new EmbedBuilder()
       .setTitle('Select a Channel')
       .setDescription(
-        `Loaded **${messages.length} ${messageWord}** from ${sourceLabel}.\n` +
+        `Loaded **${messages.length} ${messageWord}**.\n` +
         'Choose the channel where the embed(s) should be sent.',
       )
       .setColor(0x0099ff);
@@ -271,7 +187,7 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // ── Channel select-menu handler ──────────────────────────────────────────
+
   if (!interaction.isStringSelectMenu()) return;
   if (interaction.customId !== 'embed_channel_select') return;
 
@@ -327,11 +243,11 @@ client.once('ready', async () => {
 
   const deployCommand = new SlashCommandBuilder()
     .setName('deploy')
-    .setDescription('Deploy a webhook payload from a discohook.app share link or a direct JSON URL')
+    .setDescription('Deploy a webhook embed payload from a JSON URL or raw JSON text')
     .addStringOption((option) =>
       option
         .setName('url')
-        .setDescription('A discohook.app share link (e.g. https://discohook.app/?share=…) or a direct JSON URL')
+        .setDescription('A URL that returns JSON embed data, or raw JSON pasted directly')
         .setRequired(true),
     );
 
