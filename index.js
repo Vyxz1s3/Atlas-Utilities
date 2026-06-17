@@ -1,9 +1,8 @@
 const {
   Client,
   GatewayIntentBits,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   ActionRowBuilder,
   EmbedBuilder,
   ChannelType,
@@ -20,8 +19,9 @@ const client = new Client({
 const app = express();
 app.use(express.json());
 
-// Stores parsed embed payloads keyed by a unique pending key so the modal
-// submit handler can retrieve them after the user types a channel name.
+// Stores parsed embed payloads keyed by a unique pending key so the
+// select-menu interaction handler can retrieve them after the user picks
+// a channel from the dropdown.
 const pendingEmbeds = new Map();
 
 /**
@@ -110,9 +110,8 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'deploy') {
     const input = interaction.options.getString('url', true).trim();
 
-    // We cannot defer here because showModal must be the first (and only)
-    // response to the interaction. Parse/fetch the JSON first, then show
-    // the modal — all within Discord's 3-second acknowledgement window.
+    await interaction.deferReply({ ephemeral: true });
+
     let messages;
 
     // Determine whether the input is a URL or raw JSON text.
@@ -125,9 +124,8 @@ client.on('interactionCreate', async (interaction) => {
         url = new URL(input);
         if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
       } catch {
-        return interaction.reply({
+        return interaction.editReply({
           content: '❌ Invalid URL. Please provide a valid `http` or `https` URL.',
-          ephemeral: true,
         });
       }
 
@@ -137,18 +135,16 @@ client.on('interactionCreate', async (interaction) => {
           headers: { Accept: 'application/json' },
         });
         if (!response.ok) {
-          return interaction.reply({
+          return interaction.editReply({
             content: `❌ Failed to fetch URL — server responded with \`${response.status} ${response.statusText}\`.`,
-            ephemeral: true,
           });
         }
         const json = await response.json();
         messages = normalisePayload(json);
       } catch (err) {
         console.error('/deploy fetch error:', err);
-        return interaction.reply({
+        return interaction.editReply({
           content: `❌ Could not fetch or parse JSON from the URL: ${err.message}`,
-          ephemeral: true,
         });
       }
     } else {
@@ -157,78 +153,97 @@ client.on('interactionCreate', async (interaction) => {
       try {
         json = JSON.parse(input);
       } catch {
-        return interaction.reply({
+        return interaction.editReply({
           content: '❌ Input is not a valid URL and could not be parsed as JSON. Please provide a URL that returns JSON or paste raw JSON directly.',
-          ephemeral: true,
         });
       }
       messages = normalisePayload(json);
     }
 
     if (!messages || messages.length === 0) {
-      return interaction.reply({ content: '❌ No message data found in the provided input.', ephemeral: true });
+      return interaction.editReply({ content: '❌ No message data found in the provided input.' });
     }
 
-    // Store the parsed messages keyed by a unique ID so the modal submit
-    // handler can retrieve them after the user types a channel name.
+    // Fetch all text channels in the guild.
+    const guild = await client.guilds.fetch(interaction.guild.id);
+    const channels = await guild.channels.fetch();
+    const textChannels = [...channels.filter((ch) => ch?.type === ChannelType.GuildText).values()]
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    if (textChannels.length === 0) {
+      return interaction.editReply({ content: '❌ No text channels found in this server.' });
+    }
+
+    // Store the parsed messages keyed by a unique ID so the select-menu
+    // handler can retrieve them after the user picks a channel.
     const pendingKey = `${interaction.user.id}_${Date.now()}`;
     pendingEmbeds.set(pendingKey, { messages, guildId: interaction.guild.id });
 
-    // Build a modal with a single text input for the channel name.
-    const modal = new ModalBuilder()
-      .setCustomId(`channel_modal:${pendingKey}`)
-      .setTitle('Choose a Channel');
+    // Discord allows up to 25 options per StringSelectMenu and up to 5
+    // ActionRows per message. We therefore support up to 125 channels
+    // across 5 paginated select menus sent as a single ephemeral reply.
+    const MAX_OPTIONS = 25;
+    const MAX_ROWS = 5;
+    const channelChunks = [];
+    for (let i = 0; i < textChannels.length && channelChunks.length < MAX_ROWS; i += MAX_OPTIONS) {
+      channelChunks.push(textChannels.slice(i, i + MAX_OPTIONS));
+    }
 
-    const channelInput = new TextInputBuilder()
-      .setCustomId('channel_name')
-      .setLabel('Channel name (e.g. general, announcements)')
-      .setStyle(TextInputStyle.Short)
-      .setPlaceholder('general')
-      .setMinLength(1)
-      .setMaxLength(100)
-      .setRequired(true);
+    const actionRows = channelChunks.map((chunk, idx) => {
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`channel_select:${pendingKey}:${idx}`)
+        .setPlaceholder(
+          channelChunks.length > 1
+            ? `Select a channel (${idx * MAX_OPTIONS + 1}–${idx * MAX_OPTIONS + chunk.length})`
+            : 'Select a channel',
+        )
+        .addOptions(
+          chunk.map((ch) =>
+            new StringSelectMenuOptionBuilder()
+              .setLabel(`#${ch.name}`)
+              .setValue(ch.id),
+          ),
+        );
+      return new ActionRowBuilder().addComponents(menu);
+    });
 
-    modal.addComponents(new ActionRowBuilder().addComponents(channelInput));
-
-    // showModal is the interaction response — no defer/reply before this.
-    return interaction.showModal(modal);
+    const truncated = textChannels.length > MAX_ROWS * MAX_OPTIONS;
+    return interaction.editReply({
+      content: truncated
+        ? `📋 Select a channel below. *(Showing first ${MAX_ROWS * MAX_OPTIONS} of ${textChannels.length} channels.)*`
+        : '📋 Select a channel to send the embed to:',
+      components: actionRows,
+    });
   }
 
-  // ── Modal submit: channel name typed by the user ─────────────────────────
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('channel_modal:')) {
-    const pendingKey = interaction.customId.slice('channel_modal:'.length);
+  // ── Select-menu: user picked a channel from the dropdown ─────────────────
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('channel_select:')) {
+    // customId format: channel_select:<pendingKey>:<pageIndex>
+    const withoutPrefix = interaction.customId.slice('channel_select:'.length);
+    // pendingKey itself contains one underscore (userId_timestamp), so split
+    // from the right to isolate the trailing page index.
+    const lastColon = withoutPrefix.lastIndexOf(':');
+    const pendingKey = withoutPrefix.slice(0, lastColon);
     const data = pendingEmbeds.get(pendingKey);
 
     if (!data) {
-      return interaction.reply({ content: '⚠️ Embed data not found — it may have expired. Please run `/deploy` again.', ephemeral: true });
+      return interaction.reply({
+        content: '⚠️ Embed data not found — it may have expired. Please run `/deploy` again.',
+        ephemeral: true,
+      });
     }
 
-    const rawName = interaction.fields.getTextInputValue('channel_name').trim().toLowerCase().replace(/^#/, '');
+    const channelId = interaction.values[0];
 
     await interaction.deferReply({ ephemeral: true });
 
     try {
       const guild = await client.guilds.fetch(data.guildId);
-      const channels = await guild.channels.fetch();
-      const textChannels = channels.filter((ch) => ch?.type === ChannelType.GuildText);
+      const channel = await guild.channels.fetch(channelId);
 
-      // Find channels whose name contains the typed string (case-insensitive).
-      const matches = textChannels.filter((ch) => ch.name.toLowerCase().includes(rawName));
-
-      if (matches.size === 0) {
-        return interaction.editReply({
-          content: `❌ No text channel found matching **"${rawName}"**. Check the name and try again.`,
-        });
+      if (!channel) {
+        return interaction.editReply({ content: '❌ Could not find the selected channel.' });
       }
-
-      if (matches.size > 1) {
-        const list = matches.map((ch) => `• #${ch.name}`).join('\n');
-        return interaction.editReply({
-          content: `⚠️ Multiple channels match **"${rawName}"**. Please be more specific:\n${list}`,
-        });
-      }
-
-      const channel = matches.first();
 
       // Send every message from the payload in order.
       for (const msgPayload of data.messages) {
@@ -253,11 +268,14 @@ client.on('interactionCreate', async (interaction) => {
       const count = data.messages.length;
       const messageWord = count === 1 ? 'message' : 'messages';
 
+      // Remove the dropdown from the original reply now that a channel was chosen.
+      await interaction.message.edit({ components: [] }).catch(() => {});
+
       return interaction.editReply({
         content: `✅ Sent **${count} ${messageWord}** to <#${channel.id}>`,
       });
     } catch (err) {
-      console.error('Modal submit handler error:', err);
+      console.error('Select-menu handler error:', err);
       return interaction.editReply({ content: `❌ Failed to send embed: ${err.message}` });
     }
   }
